@@ -43,6 +43,7 @@ All endpoints are under `/api`, use the normal session cookie (+ CSRF header) **
 |---|---|---|
 | 200 `{"index":N,"duplicate":bool}` | Chunk N is durably recorded. | Continue. Only this JSON confirms a chunk — a bare 200 from a proxy does not. |
 | 400 `chunk_length_mismatch` | Body length ≠ expected. | Re-send. |
+| 409 `chunk_in_progress` + `Retry-After` | A previous attempt for this chunk is still being received (typical after a proxy gave up on a slow request). | Wait, retry — not a failure. |
 | 409 `chunk_conflict` | Index already stored with different content. | Abort/restart the session. |
 | 422 `chunk_checksum_mismatch` | Body does not match `X-Chunk-SHA256` (corruption in transit). | Re-send. |
 | 429 + `Retry-After` | Backpressure (`server_busy`, `too_many_parallel_chunks`, `staging_window_full`). | Wait, retry. |

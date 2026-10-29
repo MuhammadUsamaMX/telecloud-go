@@ -12,6 +12,8 @@ type View struct {
 	State           string `json:"state"`
 	Filename        string `json:"filename"`
 	TotalSize       int64  `json:"total_size"`
+	Path            string `json:"path"`
+	ExpectedSHA256  string `json:"expected_sha256,omitempty"`
 	ChunkSize       int64  `json:"chunk_size"`
 	TotalChunks     int64  `json:"total_chunks"`
 	PartSize        int64  `json:"part_size"`
@@ -51,7 +53,7 @@ func (m *Manager) view(id, owner string) (*View, error) {
 		return nil, err
 	}
 	v := &View{
-		ID: s.ID, State: s.State, Filename: s.Filename, TotalSize: s.TotalSize, ChunkSize: s.ChunkSize,
+		ID: s.ID, State: s.State, Filename: s.Filename, Path: s.Path, ExpectedSHA256: deref(s.ExpectedSHA256), TotalSize: s.TotalSize, ChunkSize: s.ChunkSize,
 		TotalChunks: s.TotalChunks, PartSize: s.PartSize, TotalParts: s.TotalParts,
 		BytesReceived: bytes, ConfirmedChunks: n, RetryCount: s.RetryCount,
 		FailureReason: deref(s.FailureReason), FileID: s.FileID, FinalName: deref(s.FinalName),

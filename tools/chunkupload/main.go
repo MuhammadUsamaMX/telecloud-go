@@ -37,6 +37,8 @@ type session struct {
 	ChunkSize       int64      `json:"chunk_size"`
 	TotalChunks     int64      `json:"total_chunks"`
 	Filename        string     `json:"filename"`
+	Path            string     `json:"path"`
+	ExpectedSHA256  string     `json:"expected_sha256"`
 	BytesReceived   int64      `json:"bytes_received"`
 	ConfirmedChunks int64      `json:"confirmed_chunks"`
 	ConfirmedRanges [][2]int64 `json:"confirmed_ranges"`
@@ -165,7 +167,11 @@ func main() {
 		_, err = c.json("GET", "/api/uploads", nil, &list)
 		check(err)
 		for _, cand := range list.Sessions {
-			if cand.Filename == baseName(*file) && cand.TotalSize == size && cand.State == "open" {
+			// Only resume a session for this exact file and destination; a
+			// session created without a checksum (e.g. by the web UI) cannot be
+			// proven to match, so it is skipped.
+			if cand.Filename == baseName(*file) && cand.TotalSize == size && cand.State == "open" &&
+				cand.Path == *dest && cand.ExpectedSHA256 == whole {
 				s = cand
 				fmt.Printf("resuming session %s (%d/%d chunks already confirmed)\n", s.ID, s.ConfirmedChunks, s.TotalChunks)
 				break
@@ -250,10 +256,21 @@ func main() {
 	fmt.Printf("\nuploaded %d chunks in %.1fs\n", confirmed, time.Since(t0).Seconds())
 
 	// Finalize and wait for the server to store the last parts and publish.
+	finalizeErrs := 0
 	for {
 		var v session
 		code, err := c.json("POST", "/api/uploads/"+s.ID+"/finalize", map[string]string{"sha256": whole}, &v)
-		check(err)
+		if err != nil {
+			// Finalize is idempotent, so transient failures (network, 5xx, 429,
+			// Cloudflare 52x) are simply retried; anything else is final.
+			if finalizeErrs++; finalizeErrs <= 30 && (code == 0 || code == 429 || code >= 500) {
+				fmt.Printf("finalize: transient error (%v), retrying\n", err)
+				time.Sleep(time.Duration(2+rand.Intn(4)) * time.Second)
+				continue
+			}
+			check(err)
+		}
+		finalizeErrs = 0
 		fmt.Printf("finalize: %d state=%s parts=%d/%d retries=%d\n", code, v.State, v.PartsStored, v.TotalParts, v.RetryCount)
 		if v.State == "finalized" {
 			s = v

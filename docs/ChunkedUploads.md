@@ -1,0 +1,84 @@
+# 📦 Resumable Chunked Uploads / Tải lên theo từng phần có thể tiếp tục
+
+> 🇻🇳 Tóm tắt: API `/api/uploads` chia tệp lớn thành nhiều request nhỏ (mặc định 32 MiB, tối đa 50 MiB) để vượt qua giới hạn body của Cloudflare Tunnel (100 MB), có kiểm tra SHA-256 từng phần, tiếp tục được sau khi mất kết nối hoặc khởi động lại máy chủ. Chi tiết bằng tiếng Anh bên dưới.
+
+Proxies such as **Cloudflare Tunnel** reject request bodies above a plan limit (100 MB on Free/Pro). TeleCloud's upload sessions split a file into **HTTP transport chunks**, each far below that limit, and store the result as one logical file.
+
+> **Size limits.** Chunking removes the per-request bottleneck. It does **not** make storage unlimited: the maximum logical file size is bounded by Telegram's current upload/download constraints, available storage, database capacity, throughput, and the successful recovery of every stored part. Very large files (terabyte scale) should be validated end to end in your own deployment before production use.
+
+## How it works
+
+```
+client ──PUT 32 MiB chunk──▶ staging file ──all chunks of a part present──▶ Telegram message ──▶ staging file deleted
+         (sha256 verified)    (fsync, row in DB)                              (message_id in DB)
+                                                  all parts stored + whole-file sha256 OK ──▶ file published (one transaction)
+```
+
+* **Transport chunks** (HTTP) and **storage parts** (Telegram) are separate. A storage part is the largest multiple of the chunk size that fits the account limit (e.g. 59 × 32 MiB = 1888 MiB for a 1900 MiB limit), so a chunk never straddles two parts.
+* A part is sent to Telegram as soon as its chunks arrive, then its staging file is removed. Local disk use is therefore bounded by `CHUNKED_UPLOAD_STAGED_PARTS × part size`, **independent of the file size**. Memory use is bounded by a small copy buffer per in-flight chunk request.
+* Chunk progress, part state and the running whole-file SHA-256 state are persisted. After a restart `Resume` continues without repeating completed work.
+* The file appears in the file browser **only** after every part is stored and the size and SHA-256 match.
+
+## Endpoints
+
+All endpoints are under `/api`, use the normal session cookie (+ CSRF header) **or** HTTP Basic auth, and are scoped to the authenticated user.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/uploads/config` | Effective settings (threshold, chunk size, parallelism). Clients use chunked upload for files above `threshold_bytes`. |
+| GET | `/uploads` | Your unfinished sessions (to resume after losing the ID). |
+| POST | `/uploads` | Create a session. JSON: `filename`, `path`, `size`, optional `chunk_size`, `mime_type`, `overwrite`, `sha256` (whole file). |
+| GET | `/uploads/:id` | Status / resume point. |
+| PUT | `/uploads/:id/chunks/:index` | Upload one chunk. Raw body, `Content-Length`, header `X-Chunk-SHA256: <hex>`. |
+| POST | `/uploads/:id/finalize` | Verify and publish. JSON `{"sha256": "<hex>"}` (optional if given at creation). Idempotent. |
+| DELETE | `/uploads/:id` | Cancel and discard temporary data. A finalized upload cannot be cancelled. |
+
+### Status fields
+
+`state` (`open`, `finalizing`, `finalized`, `failed`, `cancelled`), `total_size`, `bytes_received`, `confirmed_chunks`, `total_chunks`, `confirmed_ranges` (inclusive `[first,last]` pairs), `parts_stored`/`total_parts`, `throughput_bytes_per_sec`, `retry_count`, `failure_reason`, `file_id`, `expires_at`. Logs contain only the first 8 characters of the session ID and counters — never credentials, file names or content.
+
+### Responses to know
+
+| Code | Meaning | Client action |
+|---|---|---|
+| 200 `{"index":N,"duplicate":bool}` | Chunk N is durably recorded. | Continue. Only this JSON confirms a chunk — a bare 200 from a proxy does not. |
+| 400 `chunk_length_mismatch` | Body length ≠ expected. | Re-send. |
+| 409 `chunk_conflict` | Index already stored with different content. | Abort/restart the session. |
+| 422 `chunk_checksum_mismatch` | Body does not match `X-Chunk-SHA256` (corruption in transit). | Re-send. |
+| 429 + `Retry-After` | Backpressure (`server_busy`, `too_many_parallel_chunks`, `staging_window_full`). | Wait, retry. |
+| 503 + `Retry-After` | Telegram not ready (e.g. starting up). | Wait, retry. |
+| 409 `incomplete_upload` | Finalize with missing chunks (lists the first missing). | Upload them, finalize again. |
+| 202 (finalize) | Last parts are still being stored. | Poll `GET /uploads/:id` or call finalize again until `finalized` (HTTP 200). |
+
+Re-sending a confirmed chunk with identical content is a harmless no-op, so retries after an unknown outcome are always safe.
+
+### Example (curl)
+
+```bash
+SIZE=$(stat -c %s big.iso); SHA=$(sha256sum big.iso | cut -d' ' -f1)
+ID=$(curl -s -u user:pass -H 'Content-Type: application/json' \
+  -d "{\"filename\":\"big.iso\",\"path\":\"/\",\"size\":$SIZE,\"sha256\":\"$SHA\"}" \
+  https://cloud.example.com/api/uploads | jq -r .id)
+# chunk i (32 MiB each)
+dd if=big.iso bs=33554432 skip=0 count=1 2>/dev/null > /tmp/c0
+curl -u user:pass -X PUT --data-binary @/tmp/c0 \
+  -H "X-Chunk-SHA256: $(sha256sum /tmp/c0 | cut -d' ' -f1)" \
+  https://cloud.example.com/api/uploads/$ID/chunks/0
+curl -u user:pass -X POST https://cloud.example.com/api/uploads/$ID/finalize
+```
+
+A complete client with parallel workers, resume, retry/backoff and fault injection lives in [`tools/chunkupload`](../tools/chunkupload/main.go):
+
+```bash
+TC_USER=me TC_PASS=... go run ./tools/chunkupload -url https://cloud.example.com -file big.iso -path /Backups -verify-download
+```
+
+## Configuration
+
+See [Configuration.md](Configuration.md#chunked-upload) for the variables. Recommended starting point for Cloudflare Tunnel: leave the defaults (32 MiB chunks, 3–4 parallel). If your network is slow, lower `CHUNK_SIZE_MB` so one request finishes well within Cloudflare's ~100 s proxy timeout (for example 8–16 MiB below ~2 MiB/s).
+
+## Cleanup and safety
+
+* Sessions idle longer than `CHUNKED_UPLOAD_SESSION_TTL_HOURS` are removed together with their staging files and any Telegram parts that were never published.
+* Cleanup only touches the session tables, its own staging directory (`CHUNKED_UPLOAD_DIR`, kept outside `TEMP_DIR`) and Telegram messages that no published file references. Finalized uploads lose only their bookkeeping row.
+* If the server crashes while a part is being sent to Telegram, that one message may be left behind in the log group (the upload is retried and the file stays correct).

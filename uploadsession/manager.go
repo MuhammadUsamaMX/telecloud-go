@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +36,9 @@ import (
 // maxTotalChunks bounds per-session metadata (rows). At the 50 MiB hard cap
 // this is ~47 TiB; the practical limit is Telegram, storage and time.
 const maxTotalChunks = 1_000_000
+
+// maxOpenSessionsPerUser bounds unfinished sessions (and so staging disk) per user.
+const maxOpenSessionsPerUser = 32
 
 var (
 	idRe     = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -53,6 +57,8 @@ type Manager struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup // pipeline goroutines, drained by Close
+	closed bool           // guarded by mu
 
 	inflight chan struct{} // process-wide bound on concurrent chunk requests
 	partSem  chan struct{} // bound on concurrent Telegram part uploads
@@ -96,7 +102,31 @@ func New(cfg *config.Config, bridge Bridge) *Manager {
 }
 
 // Close stops background work. Persisted state is kept.
-func (m *Manager) Close() { m.cancel() }
+// Close stops all background work and waits for it to finish. Staged data and
+// session rows are left intact so a later Resume continues the uploads.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	m.cancel()
+	m.wg.Wait()
+}
+
+// spawn runs fn in a tracked goroutine; it is a no-op once the manager is closed.
+func (m *Manager) spawn(fn func()) bool {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return false
+	}
+	m.wg.Add(1)
+	m.mu.Unlock()
+	go func() {
+		defer m.wg.Done()
+		fn()
+	}()
+	return true
+}
 
 func (m *Manager) enabled() bool { return m.cfg.ChunkedUpload.Enabled }
 
@@ -159,6 +189,16 @@ func (m *Manager) Create(p CreateParams) (*View, error) {
 	if p.SHA256 != "" && !sha256Re.MatchString(p.SHA256) {
 		return nil, errBadChecksum
 	}
+	if p.TotalSize > maxTotalChunks*chunk {
+		return nil, newErr(http.StatusRequestEntityTooLarge, "file_too_large", "file would need too many chunks; raise chunk_size")
+	}
+	var open int
+	if err := database.RODB.Get(&open, "SELECT COUNT(*) FROM upload_sessions WHERE owner = ? AND state IN (?, ?)", p.Owner, StateOpen, StateFinalizing); err != nil {
+		return nil, err
+	}
+	if open >= maxOpenSessionsPerUser {
+		return nil, &Error{Status: http.StatusTooManyRequests, Code: "too_many_sessions", Message: "finish or cancel an existing upload first", RetryAfter: 30}
+	}
 	totalChunks := (p.TotalSize + chunk - 1) / chunk
 	if totalChunks > maxTotalChunks {
 		return nil, newErr(http.StatusRequestEntityTooLarge, "file_too_large", "file would need too many chunks; raise chunk_size")
@@ -181,9 +221,16 @@ func (m *Manager) Create(p CreateParams) (*View, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	var mime, sum interface{}
+	var mimeArg, sum interface{}
+	// Same fallback as the single-request upload: browsers/CLIs often send a
+	// generic type, so derive it from the extension.
+	if p.MimeType == "" || p.MimeType == "application/octet-stream" {
+		if t := mime.TypeByExtension(filepath.Ext(p.Filename)); t != "" {
+			p.MimeType = t
+		}
+	}
 	if p.MimeType != "" {
-		mime = p.MimeType
+		mimeArg = p.MimeType
 	}
 	if p.SHA256 != "" {
 		sum = p.SHA256
@@ -195,7 +242,7 @@ func (m *Manager) Create(p CreateParams) (*View, error) {
 	if _, err := tx.Exec(`INSERT INTO upload_sessions
 		(id, owner, filename, path, mime_type, overwrite, total_size, chunk_size, total_chunks, part_size, total_parts, state, expected_sha256, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, p.Owner, p.Filename, p.Path, mime, ow, p.TotalSize, chunk, totalChunks, partSize, totalParts, StateOpen, sum, ts, ts); err != nil {
+		id, p.Owner, p.Filename, p.Path, mimeArg, ow, p.TotalSize, chunk, totalChunks, partSize, totalParts, StateOpen, sum, ts, ts); err != nil {
 		return nil, err
 	}
 	for i := int64(0); i < totalParts; i++ {
@@ -256,7 +303,7 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 	if c, err := loadChunk(id, index); err != nil {
 		return nil, err
 	} else if c != nil {
-		return m.duplicate(c, sum)
+		return m.dupResult(s, c, sum)
 	}
 	if s.State != StateOpen {
 		return nil, errNotOpen
@@ -289,6 +336,15 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 		rt.mu.Unlock()
 	}()
 
+	// Re-check under the per-chunk lock: another request may have confirmed
+	// this chunk while we were waiting. A confirmed chunk's bytes are immutable
+	// (they may already be hashed or sent to Telegram), so never write them.
+	if c, err := loadChunk(id, index); err != nil {
+		return nil, err
+	} else if c != nil {
+		return m.dupResult(s, c, sum)
+	}
+
 	partIdx := offset / s.PartSize
 	if err := m.checkWindow(s, partIdx); err != nil {
 		return nil, err
@@ -306,7 +362,7 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 	h := sha256.New()
 	bp := bufPool.Get().(*[]byte)
 	w := io.NewOffsetWriter(f, offset-partIdx*s.PartSize)
-	n, err := io.CopyBuffer(w, io.TeeReader(io.LimitReader(body, expected+1), h), *bp)
+	n, err := io.CopyBuffer(w, io.TeeReader(io.LimitReader(body, expected), h), *bp)
 	bufPool.Put(bp)
 	if err != nil {
 		var mbe *http.MaxBytesError
@@ -319,6 +375,12 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 		return nil, newErr(http.StatusBadRequest, "chunk_read_failed", "upload interrupted; retry the chunk")
 	}
 	if n != expected {
+		return nil, newErr(http.StatusBadRequest, "chunk_length_mismatch", fmt.Sprintf("chunk %d must be exactly %d bytes", index, expected))
+	}
+	// Exactly `expected` bytes were written; anything beyond is an error. The
+	// excess byte is never written to the staging file.
+	var probe [1]byte
+	if k, _ := body.Read(probe[:]); k > 0 {
 		return nil, newErr(http.StatusBadRequest, "chunk_length_mismatch", fmt.Sprintf("chunk %d must be exactly %d bytes", index, expected))
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != sum {
@@ -339,7 +401,7 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 		if err != nil || c == nil {
 			return nil, errors.New("chunk vanished")
 		}
-		return m.duplicate(c, sum)
+		return m.dupResult(s, c, sum)
 	}
 	database.DB.Exec("UPDATE upload_sessions SET updated_at = ?, last_chunk_at = ? WHERE id = ?", now(), now(), id)
 
@@ -347,6 +409,16 @@ func (m *Manager) ReceiveChunk(owner, id string, index int64, body io.Reader, co
 		return nil, err
 	}
 	return &ChunkResult{Index: index, Size: expected}, nil
+}
+
+// dupResult answers a request for an already-confirmed chunk. It also repairs
+// a part whose promotion was lost to a transient error after the last chunk
+// of that part was recorded.
+func (m *Manager) dupResult(s *Session, c *Chunk, sum string) (*ChunkResult, error) {
+	if s.State == StateOpen {
+		m.maybeReadyPart(s, c.Index*s.ChunkSize/s.PartSize)
+	}
+	return m.duplicate(c, sum)
 }
 
 func (m *Manager) duplicate(c *Chunk, sum string) (*ChunkResult, error) {
@@ -454,6 +526,10 @@ func (m *Manager) Finalize(owner, id, sum string) (*View, error) {
 		e := newErr(http.StatusConflict, "incomplete_upload", fmt.Sprintf("%d of %d chunks confirmed; first missing: %v", n, s.TotalChunks, missing))
 		return nil, e
 	}
+	// Repair any part whose promotion was lost to a transient error.
+	for i := int64(0); i < s.TotalParts; i++ {
+		m.maybeReadyPart(s, i)
+	}
 	if s.State == StateOpen {
 		if _, err := database.DB.Exec("UPDATE upload_sessions SET state = ?, expected_sha256 = ?, updated_at = ? WHERE id = ? AND state = ?",
 			StateFinalizing, sum, now(), id, StateOpen); err != nil {
@@ -476,8 +552,18 @@ func (m *Manager) Cancel(owner, id string) (*View, error) {
 		return nil, newErr(http.StatusConflict, "session_finalized", "committed uploads cannot be cancelled; delete the file instead")
 	}
 	if s.State != StateCancelled {
-		setState(id, StateCancelled, "cancelled by client")
-		m.discard(id)
+		changed, err := setState(id, StateCancelled, "cancelled by client")
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			// Lost a race with publication: the upload is committed.
+			if cur, err := loadSession(id); err == nil && cur.State == StateFinalized {
+				return nil, newErr(http.StatusConflict, "session_finalized", "committed uploads cannot be cancelled; delete the file instead")
+			}
+		} else {
+			m.discard(id)
+		}
 	}
 	return m.view(id, owner)
 }

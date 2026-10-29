@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"telecloud/database"
+	"telecloud/tgclient"
 )
 
 // maxPartRounds bounds how many times a part is handed to the Telegram bridge
@@ -31,7 +32,11 @@ func (m *Manager) kick(id string) {
 	}
 	rt.pumping = true
 	rt.mu.Unlock()
-	go m.pump(rt)
+	if !m.spawn(func() { m.pump(rt) }) {
+		rt.mu.Lock()
+		rt.pumping = false
+		rt.mu.Unlock()
+	}
 }
 
 func (m *Manager) pump(rt *runtime) {
@@ -54,7 +59,16 @@ func (m *Manager) step(rt *runtime) {
 		return
 	}
 	if err := m.advanceHash(rt, s); err != nil {
-		m.fail(rt.id, "staging data unavailable: "+err.Error())
+		switch {
+		case rt.ctx.Err() != nil:
+			// Cancelled or shutting down: never mistake that for data loss.
+		case errors.Is(err, os.ErrNotExist) || errors.Is(err, errStagingSize):
+			m.fail(rt.id, "staged data is missing or damaged")
+		default:
+			// Transient (EMFILE, EIO, busy DB): keep the session, try again.
+			log.Printf("[Upload] session=%.8s hashing will be retried: %v", rt.id, err)
+			time.AfterFunc(10*time.Second, func() { m.kick(rt.id) })
+		}
 		return
 	}
 	m.startUploads(rt, s)
@@ -87,7 +101,7 @@ func (m *Manager) advanceHash(rt *runtime, s *Session) error {
 		}
 		if st, err := f.Stat(); err != nil || st.Size() != p.Size {
 			f.Close()
-			return fmt.Errorf("part %d staging file has wrong size", p.Index)
+			return fmt.Errorf("part %d: %w", p.Index, errStagingSize)
 		}
 		_, err = io.Copy(h, &ctxReader{ctx: rt.ctx, r: io.NewSectionReader(f, 0, p.Size)})
 		f.Close()
@@ -107,6 +121,8 @@ func (m *Manager) advanceHash(rt *runtime, s *Session) error {
 	}
 	return nil
 }
+
+var errStagingSize = errors.New("staging file has wrong size")
 
 type ctxReader struct {
 	ctx context.Context
@@ -152,7 +168,8 @@ func (m *Manager) startUploads(rt *runtime, s *Session) {
 		}
 		rt.running[p.Index] = true
 		rt.mu.Unlock()
-		go m.uploadPart(rt, s, p)
+		pp := p
+		m.spawn(func() { m.uploadPart(rt, s, pp) })
 	}
 }
 
@@ -182,7 +199,14 @@ func (m *Manager) uploadPart(rt *runtime, s *Session, p Part) {
 
 	f, err := os.Open(m.partPath(s.ID, p.Index))
 	if err != nil {
-		m.fail(s.ID, fmt.Sprintf("part %d staging file missing", p.Index))
+		if errors.Is(err, os.ErrNotExist) {
+			m.fail(s.ID, fmt.Sprintf("part %d staging file missing", p.Index))
+			return
+		}
+		// Transient open error: put the part back and retry shortly.
+		log.Printf("[Upload] session=%.8s part=%d open failed, will retry: %v", s.ID, p.Index, err)
+		database.DB.Exec("UPDATE upload_session_parts SET state = ?, attempts = attempts - 1 WHERE session_id = ? AND part_index = ? AND state = ?", partReady, s.ID, p.Index, partUploading)
+		time.AfterFunc(10*time.Second, func() { m.kick(s.ID) })
 		return
 	}
 	defer f.Close()
@@ -212,16 +236,31 @@ func (m *Manager) uploadPart(rt *runtime, s *Session, p Part) {
 		go m.bridge.DeleteMessages(context.Background(), []int{msgID})
 		return
 	}
-	if _, err := database.DB.Exec("UPDATE upload_session_parts SET state = ?, message_id = ?, last_error = NULL, updated_at = ? WHERE session_id = ? AND part_index = ?",
-		partUploaded, msgID, now(), s.ID, p.Index); err != nil {
+	res, err = database.DB.Exec("UPDATE upload_session_parts SET state = ?, message_id = ?, last_error = NULL, updated_at = ? WHERE session_id = ? AND part_index = ?",
+		partUploaded, msgID, now(), s.ID, p.Index)
+	if err != nil {
 		log.Printf("[Upload] session=%.8s part=%d: recording message failed: %v", s.ID, p.Index, err)
+		go m.bridge.DeleteMessages(context.Background(), []int{msgID})
+		return
+	}
+	if af, _ := res.RowsAffected(); af == 0 {
+		// The session was discarded between the check above and now.
+		go m.bridge.DeleteMessages(context.Background(), []int{msgID})
 		return
 	}
 	log.Printf("[Upload] session=%.8s part=%d stored (%d bytes in %s)", s.ID, p.Index, p.Size, time.Since(started).Round(time.Second))
+	f.Close() // release() removes the file; open handles block that on Windows
 	m.release(rt, s.ID, p.Index)
 }
 
 func (m *Manager) partFailed(rt *runtime, s *Session, p Part, err error) {
+	if errors.Is(err, tgclient.ErrTelegramNotReady) {
+		// Telegram is still connecting (e.g. right after a restart): not the
+		// part's fault, so do not spend one of its attempts.
+		database.DB.Exec("UPDATE upload_session_parts SET state = ?, attempts = attempts - 1, updated_at = ? WHERE session_id = ? AND part_index = ?", partReady, now(), s.ID, p.Index)
+		time.AfterFunc(5*time.Second, func() { m.kick(s.ID) })
+		return
+	}
 	cur, _ := loadPart(s.ID, p.Index)
 	rounds := int64(1)
 	if cur != nil {
@@ -383,7 +422,7 @@ func (m *Manager) publish(s *Session, parts []Part) (int64, string, error) {
 // fail marks the session failed and discards its temporary data.
 func (m *Manager) fail(id, reason string) {
 	log.Printf("[Upload] session=%.8s failed: %s", id, reason)
-	if err := setState(id, StateFailed, reason); err != nil {
+	if changed, err := setState(id, StateFailed, reason); err != nil || !changed {
 		return
 	}
 	m.discard(id)

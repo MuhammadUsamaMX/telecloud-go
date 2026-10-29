@@ -52,6 +52,8 @@ All endpoints are under `/api`, use the normal session cookie (+ CSRF header) **
 
 Re-sending a confirmed chunk with identical content is a harmless no-op, so retries after an unknown outcome are always safe.
 
+**Tip: send `Expect: 100-continue` with chunk uploads.** Backpressure (`429`) is decided before the body is read. Without `Expect`, a client that is still streaming a 32 MiB body may see a connection reset instead of the `429` and its `Retry-After`. With `Expect: 100-continue` the server answers before any body is sent. Treat a reset like any other retryable failure, and retry the same chunk.
+
 ### Example (curl)
 
 ```bash

@@ -122,13 +122,25 @@ func chunkIndexes(id string) ([]int64, error) {
 	return idx, err
 }
 
-func setState(id, state, reason string) error {
+// setState moves a session to a new state and reports whether it changed.
+// Transitions are guarded so a terminal state is never overwritten by a racing
+// goroutine: a finalized session stays finalized, and only live sessions can
+// be failed or cancelled.
+func setState(id, state, reason string) (bool, error) {
 	var r interface{}
 	if reason != "" {
 		r = reason
 	}
-	_, err := database.DB.Exec("UPDATE upload_sessions SET state = ?, failure_reason = ?, updated_at = ? WHERE id = ?", state, r, now(), id)
-	return err
+	guard := "state IN ('open','finalizing')"
+	if state == StateCancelled {
+		guard = "state IN ('open','finalizing','failed')"
+	}
+	res, err := database.DB.Exec("UPDATE upload_sessions SET state = ?, failure_reason = ?, updated_at = ? WHERE id = ? AND "+guard, state, r, now(), id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func touch(id string) {

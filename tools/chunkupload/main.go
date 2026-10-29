@@ -134,7 +134,12 @@ func main() {
 		os.Exit(2)
 	}
 	c := &client{base: *baseURL, user: os.Getenv("TC_USER"), pass: os.Getenv("TC_PASS"),
-		http: &http.Client{Timeout: 30 * time.Minute}}
+		// ExpectContinueTimeout lets the server reject a chunk (e.g. 429
+		// backpressure) before the body is sent; the timeout makes proxies that
+		// do not support Expect fall back to sending immediately.
+		http: &http.Client{Timeout: 30 * time.Minute, Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment, ExpectContinueTimeout: 2 * time.Second,
+			MaxIdleConnsPerHost: 8, IdleConnTimeout: 60 * time.Second, ForceAttemptHTTP2: true}}}
 
 	f, err := os.Open(*file)
 	check(err)
@@ -291,7 +296,7 @@ func (c *client) sendChunk(id string, idx int64, open func() io.Reader, n int64,
 			r = bytes.NewReader(b)
 		}
 		resp, err := c.do("PUT", "/api/uploads/"+id+"/chunks/"+strconv.FormatInt(idx, 10), r, n, map[string]string{
-			"X-Chunk-SHA256": sum, "Content-Type": "application/octet-stream"})
+			"X-Chunk-SHA256": sum, "Content-Type": "application/octet-stream", "Expect": "100-continue"})
 		var retryAfter time.Duration
 		if err == nil {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

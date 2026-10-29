@@ -172,8 +172,12 @@ func reassemble(t *testing.T, b *fakeBridge, fileID int64) []byte {
 	if len(parts) == 0 {
 		var mid int
 		database.RODB.Get(&mid, "SELECT message_id FROM files WHERE id = ?", fileID)
+		b.mu.Lock()
+		defer b.mu.Unlock()
 		return b.stored[mid]
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, p := range parts {
 		out = append(out, b.stored[p.MessageID]...)
 	}
@@ -655,4 +659,54 @@ func TestConcurrentSessionsRespectLimits(t *testing.T) {
 		t.Fatalf("peak concurrent Telegram part uploads = %d, limit %d", gb.peak, cap(m.partSem))
 	}
 	t.Logf("peak concurrent chunk requests <= 3, peak concurrent Telegram part uploads = %d (limit %d)", gb.peak, cap(m.partSem))
+}
+
+// An over-long body (e.g. chunked transfer encoding, so no Content-Length
+// pre-check) must not leave an extra byte in the staging file: on the last
+// chunk of a part it would make the part the wrong size and fail the session.
+func TestOverlongBodyLeavesNoResidue(t *testing.T) {
+	initDB(t)
+	cfg, br := testCfg(t), newFakeBridge()
+	m := New(cfg, br)
+	defer m.Close()
+
+	data := randBytes(4 * mib) // 2 parts of 2 chunks
+	v := create(t, m, data)
+	for i := 0; i < 4; i++ {
+		good := data[i*mib : (i+1)*mib]
+		long := append(append([]byte(nil), good...), 0xAA)
+		_, err := m.ReceiveChunk("alice", v.ID, int64(i), bytes.NewReader(long), -1, sum(good))
+		wantCode(t, err, http.StatusBadRequest, "chunk_length_mismatch")
+		putRetry(t, m, v.ID, i, data, mib)
+	}
+	if _, err := m.Finalize("alice", v.ID, sum(data)); err != nil {
+		t.Fatal(err)
+	}
+	var fin *View
+	waitFor(t, "finalized", func() bool {
+		fin, _ = m.Status("alice", v.ID)
+		return fin != nil && (fin.State == StateFinalized || fin.State == StateFailed)
+	})
+	if fin.State != StateFinalized {
+		t.Fatalf("session ended %s: %s", fin.State, fin.FailureReason)
+	}
+	if got := reassemble(t, br, *fin.FileID); !bytes.Equal(got, data) {
+		t.Fatal("reconstructed file differs from source")
+	}
+}
+
+// A terminal state must never be overwritten by a racing transition.
+func TestStateTransitionsAreGuarded(t *testing.T) {
+	initDB(t)
+	m := New(testCfg(t), newFakeBridge())
+	defer m.Close()
+	v := create(t, m, randBytes(mib))
+	if ok, err := setState(v.ID, StateFinalized, ""); err != nil || !ok {
+		t.Fatalf("open->finalized: %v %v", ok, err)
+	}
+	for _, st := range []string{StateFailed, StateCancelled, StateOpen} {
+		if ok, _ := setState(v.ID, st, "x"); ok {
+			t.Fatalf("finalized session was moved to %s", st)
+		}
+	}
 }

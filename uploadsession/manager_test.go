@@ -729,7 +729,15 @@ func TestCreateIsIdempotentForIdenticalUpload(t *testing.T) {
 	if _, err := put(m, a.ID, 0, data, mib); err != nil {
 		t.Fatal(err)
 	}
-	b := mk("/")
+	// A different requested chunk size (auto-sizing measures a new speed on
+	// every run) must still resume the same session, which keeps its own size.
+	b, err := m.Create(CreateParams{Owner: "alice", Filename: "big.bin", Path: "/", TotalSize: int64(len(data)), ChunkSize: 2 * mib, SHA256: sum(data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ChunkSize != mib {
+		t.Fatalf("resumed session must keep its chunk size, got %d", b.ChunkSize)
+	}
 	if b.ID != a.ID || b.ConfirmedChunks != 1 {
 		t.Fatalf("expected the same session with 1 confirmed chunk, got %s (%d)", b.ID, b.ConfirmedChunks)
 	}

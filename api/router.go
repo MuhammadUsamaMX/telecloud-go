@@ -193,6 +193,7 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 
 		// Resumable chunked upload sessions
 		api.GET("/uploads/config", h.handleGetUploadsConfig)
+		api.POST("/uploads/probe", h.handlePostUploadProbe)
 		api.GET("/uploads", h.handleListUploads)
 		api.POST("/uploads", h.handleCreateUpload)
 		api.GET("/uploads/:id", h.handleGetUpload)

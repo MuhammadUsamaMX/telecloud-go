@@ -1,6 +1,7 @@
 package uploadsession
 
 import (
+	"telecloud/config"
 	"time"
 
 	"telecloud/database"
@@ -123,12 +124,22 @@ type ClientConfig struct {
 	MaxChunkB    int64 `json:"max_chunk_size_bytes"`
 	MaxParallel  int   `json:"max_parallel_chunks"`
 	SessionTTLHr int   `json:"session_ttl_hours"`
+	// Guidance for auto-sizing: chunk_size_bytes is the ceiling; a client
+	// should measure its upload speed (POST /api/uploads/probe) and choose
+	// speed * target_chunk_seconds / parallel_streams, within
+	// [min_chunk_size_bytes, chunk_size_bytes].
+	MinChunkB      int64 `json:"min_chunk_size_bytes"`
+	TargetChunkSec int   `json:"target_chunk_seconds"`
 }
+
+// TargetChunkSeconds is how long one chunk request should take. It keeps a
+// chunk well under the ~100 s origin timeout of Cloudflare Tunnel.
+const TargetChunkSeconds = 40
 
 func (m *Manager) ClientConfig() ClientConfig {
 	cu := m.cfg.ChunkedUpload
 	return ClientConfig{
 		Enabled: cu.Enabled, ThresholdB: cu.Threshold, ChunkSizeB: cu.ChunkSize,
-		MaxChunkB: 50 << 20, MaxParallel: cu.MaxParallel, SessionTTLHr: int(cu.SessionTTL / time.Hour),
+		MaxChunkB: 50 << 20, MinChunkB: config.MinChunkedUploadChunkSize, TargetChunkSec: TargetChunkSeconds, MaxParallel: cu.MaxParallel, SessionTTLHr: int(cu.SessionTTL / time.Hour),
 	}
 }

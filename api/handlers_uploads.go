@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 // Resumable upload sessions: see package uploadsession and docs/API.md.
 //
 //	GET    /api/uploads/config                  effective client settings
+//	POST   /api/uploads/probe                   discard up to 8 MiB; lets a client measure its upload speed
 //	GET    /api/uploads                         own unfinished sessions
 //	POST   /api/uploads                         create a session
 //	GET    /api/uploads/:id                     status (resume point)
@@ -50,6 +52,38 @@ func (h *Handler) handleGetUploadsConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, h.uploads.ClientConfig())
+}
+
+// maxProbeBytes bounds one speed probe; probeSlots bounds concurrent probes so
+// the endpoint cannot be used to hold many connections open.
+const maxProbeBytes = 8 << 20
+
+var probeSlots = make(chan struct{}, 4)
+
+// handlePostUploadProbe reads and discards the body so a client can time an
+// upload before choosing a chunk size. It stores nothing.
+func (h *Handler) handlePostUploadProbe(c *gin.Context) {
+	if !h.uploadsEnabled(c) {
+		return
+	}
+	select {
+	case probeSlots <- struct{}{}:
+		defer func() { <-probeSlots }()
+	default:
+		c.Header("Retry-After", "2")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "server_busy"})
+		return
+	}
+	if c.Request.ContentLength > maxProbeBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "probe_too_large"})
+		return
+	}
+	n, err := io.Copy(io.Discard, http.MaxBytesReader(c.Writer, c.Request.Body, maxProbeBytes))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "probe_failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"bytes": n})
 }
 
 func (h *Handler) handleListUploads(c *gin.Context) {

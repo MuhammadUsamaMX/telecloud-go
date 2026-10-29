@@ -62,6 +62,7 @@ func TestUploadSessionHTTPFlow(t *testing.T) {
 	user := "alice"
 	g := r.Group("/api", func(c *gin.Context) { c.Set("username", user); c.Set("is_admin", false) })
 	g.GET("/uploads/config", h.handleGetUploadsConfig)
+	g.POST("/uploads/probe", h.handlePostUploadProbe)
 	g.POST("/uploads", h.handleCreateUpload)
 	g.GET("/uploads/:id", h.handleGetUpload)
 	g.PUT("/uploads/:id/chunks/:index", h.handlePutUploadChunk)
@@ -83,6 +84,20 @@ func TestUploadSessionHTTPFlow(t *testing.T) {
 	w, conf := do("GET", "/api/uploads/config", nil, nil)
 	if w.Code != 200 || conf["max_chunk_size_bytes"].(float64) != 50*mib || conf["chunk_size_bytes"].(float64) != mib {
 		t.Fatalf("config: %d %v", w.Code, conf)
+	}
+
+	if conf["min_chunk_size_bytes"].(float64) != 1*mib || conf["target_chunk_seconds"].(float64) != uploadsession.TargetChunkSeconds {
+		t.Fatalf("auto-size guidance missing from config: %v", conf)
+	}
+
+	// Speed probe: the body is read and discarded, nothing is stored; oversized
+	// probes are refused.
+	w, pr := do("POST", "/api/uploads/probe", make([]byte, 2*mib), nil)
+	if w.Code != 200 || pr["bytes"].(float64) != 2*mib {
+		t.Fatalf("probe: %d %v", w.Code, pr)
+	}
+	if w, _ := do("POST", "/api/uploads/probe", make([]byte, 9*mib), nil); w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized probe must be refused, got %d", w.Code)
 	}
 
 	data := make([]byte, 3*mib+5)

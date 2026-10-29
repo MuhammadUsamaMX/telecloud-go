@@ -171,7 +171,7 @@ Copy `env.example` to `.env` in the binary directory and fill in your details:
 |---|---|---|
 | `CHUNKED_UPLOAD_ENABLED` | `true` | Set `false` to disable the `/api/uploads` API. Existing uploads are unaffected. |
 | `CHUNKED_UPLOAD_THRESHOLD_MB` | `80` | Files above this size should use the chunked protocol (advertised to clients). |
-| `CHUNKED_UPLOAD_CHUNK_SIZE_MB` | `32` | Default request body size. Clamped to 1–50 MiB (hard maximum). |
+| `CHUNKED_UPLOAD_CHUNK_SIZE_MB` | `32` | Ceiling for the request body size (default 32). Clamped to 1–50 MiB (hard maximum). Clients auto-size below it from a speed probe; see [ChunkedUploads.md](ChunkedUploads.md#choosing-the-chunk-size-auto-sizing). |
 | `CHUNKED_UPLOAD_MAX_PARALLEL` | `4` | Concurrent chunk requests per session (max 16). |
 | `CHUNKED_UPLOAD_MAX_INFLIGHT` | `8` | Concurrent chunk requests for the whole server (max 64). Excess requests get `429` + `Retry-After`. |
 | `CHUNKED_UPLOAD_STAGED_PARTS` | `2` | Telegram parts staged on disk per session. Disk use ≤ this × part size. |

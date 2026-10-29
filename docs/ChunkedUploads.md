@@ -27,6 +27,7 @@ All endpoints are under `/api`, use the normal session cookie (+ CSRF header) **
 |---|---|---|
 | GET | `/uploads/config` | Effective settings (threshold, chunk size, parallelism). Clients use chunked upload for files above `threshold_bytes`. |
 | GET | `/uploads` | Your unfinished sessions (to resume after losing the ID). |
+| POST | `/uploads/probe` | Speed probe: the body (up to 8 MiB) is read and discarded, response `{"bytes": N}`. Used to time an upload before choosing a chunk size. Nothing is stored. |
 | POST | `/uploads` | Create a session. JSON: `filename`, `path`, `size`, optional `chunk_size`, `mime_type`, `overwrite`, `sha256` (whole file). Idempotent when `sha256` is given: an identical open upload (same file, destination, size, chunk size and checksum) returns the existing session, so a client that lost its ID resumes by repeating the request. |
 | GET | `/uploads/:id` | Status / resume point. |
 | PUT | `/uploads/:id/chunks/:index` | Upload one chunk. Raw body, `Content-Length`, header `X-Chunk-SHA256: <hex>`. |
@@ -76,9 +77,22 @@ A complete client with parallel workers, resume, retry/backoff and fault injecti
 TC_USER=me TC_PASS=... go run ./tools/chunkupload -url https://cloud.example.com -file big.iso -path /Backups -verify-download
 ```
 
+## Choosing the chunk size (auto-sizing)
+
+A chunk request must finish within the proxy's timeout (about 100 s on Cloudflare Tunnel), otherwise the proxy answers 524/502 and the chunk is retried without making progress. How long a chunk takes depends on the client's uplink, so a fixed size is either too big for slow links or needlessly small for fast ones.
+
+* `CHUNKED_UPLOAD_CHUNK_SIZE_MB` is the **ceiling** (up to 50 MiB, the hard maximum). Setting it to `50` is safe: clients choose a smaller chunk when their connection needs it.
+* `GET /uploads/config` returns `chunk_size_bytes` (the ceiling), `min_chunk_size_bytes` (the server minimum, 4 MiB) and `target_chunk_seconds` (40). A client should time a `POST /uploads/probe` upload, then use
+
+  `chunk = clamp(speed_bytes_per_sec x target_chunk_seconds / parallel_streams, min, ceiling)`, rounded down to whole MiB,
+
+  and send it as `chunk_size` when creating the session. The chunk size is fixed for the life of a session (a resumed session keeps its own).
+* The reference client does this by default (`-chunk-mb 0`; pass `-chunk-mb N` to force a size) and the web UI does the same before it starts a large upload. Example: about 3 MiB/s with 3 parallel streams gives 40 MiB chunks; 1 MiB/s gives 13 MiB; below roughly 0.4 MiB/s it stays at the 4 MiB minimum.
+* If the probe fails, clients fall back to 16 MiB (or the ceiling if lower).
+
 ## Configuration
 
-See [Configuration.md](Configuration.md#chunked-upload) for the variables. Recommended starting point for Cloudflare Tunnel: leave the defaults (32 MiB chunks, 3–4 parallel). If your network is slow, lower `CHUNK_SIZE_MB` so one request finishes well within Cloudflare's ~100 s proxy timeout (for example 8–16 MiB below ~2 MiB/s).
+See [Configuration.md](Configuration.md#chunked-upload) for the variables. Recommended for Cloudflare Tunnel: set `CHUNKED_UPLOAD_CHUNK_SIZE_MB=50` (the ceiling) and keep 3–4 parallel; clients shrink the chunk automatically on slow links (see above). Clients that do not auto-size (for example a plain `curl` loop) should pick a chunk small enough to finish well within about 100 s, e.g. 8–16 MiB below ~2 MiB/s.
 
 ## Cleanup and safety
 

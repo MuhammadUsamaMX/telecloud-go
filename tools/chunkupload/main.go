@@ -120,7 +120,7 @@ func main() {
 		baseURL   = flag.String("url", "", "TeleCloud base URL")
 		file      = flag.String("file", "", "file to upload")
 		dest      = flag.String("path", "/", "destination folder")
-		chunkMB   = flag.Int64("chunk-mb", 32, "chunk size in MiB (1..50)")
+		chunkMB   = flag.Int64("chunk-mb", 0, "chunk size in MiB (1..50); 0 = measure the uplink and choose automatically")
 		parallel  = flag.Int("parallel", 3, "parallel chunk uploads")
 		resume    = flag.String("resume", "", "session ID to resume (default: auto-detect)")
 		overwrite = flag.Bool("overwrite", false, "replace an existing file of the same name")
@@ -163,8 +163,13 @@ func main() {
 	} else {
 		// Creating is idempotent: an identical open session (same file,
 		// destination and checksum) is returned instead of a new one.
+		chunkBytes := *chunkMB << 20
+		if *chunkMB == 0 {
+			chunkBytes = c.autoChunk(*parallel)
+			fmt.Printf("auto chunk size: %d MiB x %d parallel\n", chunkBytes>>20, *parallel)
+		}
 		_, err = c.json("POST", "/api/uploads", map[string]any{
-			"filename": baseName(*file), "path": *dest, "size": size, "chunk_size": *chunkMB << 20,
+			"filename": baseName(*file), "path": *dest, "size": size, "chunk_size": chunkBytes,
 			"overwrite": *overwrite, "sha256": whole,
 		}, &s)
 		check(err)

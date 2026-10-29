@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"time"
 
 	"telecloud/config"
@@ -89,7 +90,11 @@ func UploadStagedPart(ctx context.Context, f io.ReaderAt, size int64, partName, 
 }
 
 func uploadStagedPartOnce(ctx context.Context, f io.ReaderAt, size int64, partName, caption string, cfg *config.Config) (int, error) {
-	if Client == nil {
+	// IsSystemReady is only true once the client is connected, the log group
+	// was verified and the bot pool is settled. Uploading earlier (a resumed
+	// session can be ready the moment the process starts) races the startup
+	// checks.
+	if Client == nil || !IsSystemReady() {
 		return 0, ErrTelegramNotReady
 	}
 	api := GetAPI()
@@ -110,5 +115,16 @@ func uploadStagedPartOnce(ctx context.Context, f io.ReaderAt, size int64, partNa
 	up := uploader.NewUploader(api).
 		WithPartSize(uploader.MaximumPartSize).
 		WithThreads(adaptiveThreads(size, cfg))
-	return uploadFilePart(ctx, api, up, io.NewSectionReader(f, 0, size), partName, caption, cfg, size)
+	id, err := uploadFilePart(ctx, api, up, io.NewSectionReader(f, 0, size), partName, caption, cfg, size)
+	if err != nil && isPeerError(err) {
+		// A cached peer that Telegram rejects would otherwise be reused by
+		// every later attempt; drop it so the next attempt resolves it again.
+		forgetLogGroupPeer(api, cfg.LogGroupID)
+	}
+	return id, err
+}
+
+func isPeerError(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "PEER_ID_INVALID") || strings.Contains(m, "CHANNEL_INVALID")
 }

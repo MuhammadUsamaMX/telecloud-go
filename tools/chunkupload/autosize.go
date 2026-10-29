@@ -74,7 +74,8 @@ func (c *client) autoChunk(parallel int) int64 {
 	if _, err := c.json("GET", "/api/uploads/config", nil, &cfg); err != nil || cfg.ChunkSizeB == 0 {
 		return 16 * mib
 	}
-	if cfg.MinChunkB == 0 {
+	// Below ~4 MiB the per-request overhead dominates, so use that as the floor.
+	if cfg.MinChunkB < 4*mib {
 		cfg.MinChunkB = 4 * mib
 	}
 	if cfg.TargetSec == 0 {

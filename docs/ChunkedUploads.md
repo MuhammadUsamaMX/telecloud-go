@@ -82,12 +82,12 @@ TC_USER=me TC_PASS=... go run ./tools/chunkupload -url https://cloud.example.com
 A chunk request must finish within the proxy's timeout (about 100 s on Cloudflare Tunnel), otherwise the proxy answers 524/502 and the chunk is retried without making progress. How long a chunk takes depends on the client's uplink, so a fixed size is either too big for slow links or needlessly small for fast ones.
 
 * `CHUNKED_UPLOAD_CHUNK_SIZE_MB` is the **ceiling** (up to 50 MiB, the hard maximum). Setting it to `50` is safe: clients choose a smaller chunk when their connection needs it.
-* `GET /uploads/config` returns `chunk_size_bytes` (the ceiling), `min_chunk_size_bytes` (the server minimum, 4 MiB) and `target_chunk_seconds` (40). A client should time a `POST /uploads/probe` upload, then use
+* `GET /uploads/config` returns `chunk_size_bytes` (the ceiling), `min_chunk_size_bytes` (the smallest chunk the server accepts, 1 MiB; clients may use a higher floor such as 4 MiB to limit the request count) and `target_chunk_seconds` (40). A client should time a `POST /uploads/probe` upload, then use
 
   `chunk = clamp(speed_bytes_per_sec x target_chunk_seconds / parallel_streams, min, ceiling)`, rounded down to whole MiB,
 
   and send it as `chunk_size` when creating the session. The chunk size is fixed for the life of a session (a resumed session keeps its own).
-* The reference client does this by default (`-chunk-mb 0`; pass `-chunk-mb N` to force a size) and the web UI does the same before it starts a large upload. Example: about 3 MiB/s with 3 parallel streams gives 40 MiB chunks; 1 MiB/s gives 13 MiB; below roughly 0.4 MiB/s it stays at the 4 MiB minimum.
+* The reference client does this by default (`-chunk-mb 0`; pass `-chunk-mb N` to force a size) and the web UI does the same before it starts a large upload. Example: about 3 MiB/s with 3 parallel streams gives 40 MiB chunks; 1.6 MiB/s gives 21 MiB; 1 MiB/s gives 13 MiB; very slow links go down to the client's floor (4 MiB in the reference client).
 * If the probe fails, clients fall back to 16 MiB (or the ceiling if lower).
 
 ## Configuration

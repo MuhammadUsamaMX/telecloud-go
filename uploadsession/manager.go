@@ -189,6 +189,21 @@ func (m *Manager) Create(p CreateParams) (*View, error) {
 	if p.SHA256 != "" && !sha256Re.MatchString(p.SHA256) {
 		return nil, errBadChecksum
 	}
+	// Idempotent create: the same owner, file, destination, size, chunk size
+	// and whole-file checksum maps to the open session already holding the
+	// confirmed chunks, so a client that lost its session ID simply resumes.
+	if p.SHA256 != "" {
+		ow := 0
+		if p.Overwrite {
+			ow = 1
+		}
+		var existing string
+		err := database.RODB.Get(&existing, "SELECT id FROM upload_sessions WHERE owner = ? AND filename = ? AND path = ? AND total_size = ? AND chunk_size = ? AND overwrite = ? AND expected_sha256 = ? AND state = ? ORDER BY created_at LIMIT 1",
+			p.Owner, p.Filename, p.Path, p.TotalSize, chunk, ow, p.SHA256, StateOpen)
+		if err == nil {
+			return m.view(existing, p.Owner)
+		}
+	}
 	if p.TotalSize > maxTotalChunks*chunk {
 		return nil, newErr(http.StatusRequestEntityTooLarge, "file_too_large", "file would need too many chunks; raise chunk_size")
 	}

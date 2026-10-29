@@ -161,28 +161,16 @@ func main() {
 		_, err = c.json("GET", "/api/uploads/"+*resume, nil, &s)
 		check(err)
 	} else {
-		var list struct {
-			Sessions []session `json:"sessions"`
-		}
-		_, err = c.json("GET", "/api/uploads", nil, &list)
+		// Creating is idempotent: an identical open session (same file,
+		// destination and checksum) is returned instead of a new one.
+		_, err = c.json("POST", "/api/uploads", map[string]any{
+			"filename": baseName(*file), "path": *dest, "size": size, "chunk_size": *chunkMB << 20,
+			"overwrite": *overwrite, "sha256": whole,
+		}, &s)
 		check(err)
-		for _, cand := range list.Sessions {
-			// Only resume a session for this exact file and destination; a
-			// session created without a checksum (e.g. by the web UI) cannot be
-			// proven to match, so it is skipped.
-			if cand.Filename == baseName(*file) && cand.TotalSize == size && cand.State == "open" &&
-				cand.Path == *dest && cand.ExpectedSHA256 == whole {
-				s = cand
-				fmt.Printf("resuming session %s (%d/%d chunks already confirmed)\n", s.ID, s.ConfirmedChunks, s.TotalChunks)
-				break
-			}
-		}
-		if s.ID == "" {
-			_, err = c.json("POST", "/api/uploads", map[string]any{
-				"filename": baseName(*file), "path": *dest, "size": size, "chunk_size": *chunkMB << 20,
-				"overwrite": *overwrite, "sha256": whole,
-			}, &s)
-			check(err)
+		if s.ConfirmedChunks > 0 {
+			fmt.Printf("resuming session %s (%d/%d chunks already confirmed)\n", s.ID, s.ConfirmedChunks, s.TotalChunks)
+		} else {
 			fmt.Printf("created session %s: %d chunks of %d MiB\n", s.ID, s.TotalChunks, s.ChunkSize>>20)
 		}
 	}

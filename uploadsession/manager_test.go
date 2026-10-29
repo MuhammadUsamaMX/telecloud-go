@@ -710,3 +710,30 @@ func TestStateTransitionsAreGuarded(t *testing.T) {
 		}
 	}
 }
+
+// Creating the same upload twice (e.g. after the client lost its session ID)
+// must return the open session that already holds the confirmed chunks.
+func TestCreateIsIdempotentForIdenticalUpload(t *testing.T) {
+	initDB(t)
+	m := New(testCfg(t), newFakeBridge())
+	defer m.Close()
+	data := randBytes(3 * mib)
+	mk := func(path string) *View {
+		v, err := m.Create(CreateParams{Owner: "alice", Filename: "big.bin", Path: path, TotalSize: int64(len(data)), ChunkSize: mib, SHA256: sum(data)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	a := mk("/")
+	if _, err := put(m, a.ID, 0, data, mib); err != nil {
+		t.Fatal(err)
+	}
+	b := mk("/")
+	if b.ID != a.ID || b.ConfirmedChunks != 1 {
+		t.Fatalf("expected the same session with 1 confirmed chunk, got %s (%d)", b.ID, b.ConfirmedChunks)
+	}
+	if c := mk("/other"); c.ID == a.ID {
+		t.Fatal("a different destination must get its own session")
+	}
+}

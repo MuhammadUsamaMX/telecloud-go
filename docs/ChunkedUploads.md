@@ -27,7 +27,7 @@ All endpoints are under `/api`, use the normal session cookie (+ CSRF header) **
 |---|---|---|
 | GET | `/uploads/config` | Effective settings (threshold, chunk size, parallelism). Clients use chunked upload for files above `threshold_bytes`. |
 | GET | `/uploads` | Your unfinished sessions (to resume after losing the ID). |
-| POST | `/uploads` | Create a session. JSON: `filename`, `path`, `size`, optional `chunk_size`, `mime_type`, `overwrite`, `sha256` (whole file). |
+| POST | `/uploads` | Create a session. JSON: `filename`, `path`, `size`, optional `chunk_size`, `mime_type`, `overwrite`, `sha256` (whole file). Idempotent when `sha256` is given: an identical open upload (same file, destination, size, chunk size and checksum) returns the existing session, so a client that lost its ID resumes by repeating the request. |
 | GET | `/uploads/:id` | Status / resume point. |
 | PUT | `/uploads/:id/chunks/:index` | Upload one chunk. Raw body, `Content-Length`, header `X-Chunk-SHA256: <hex>`. |
 | POST | `/uploads/:id/finalize` | Verify and publish. JSON `{"sha256": "<hex>"}` (optional if given at creation). Idempotent. |
